@@ -1,3 +1,124 @@
+/***********************************************************************************
+*
+*   PHYSAC IMPLEMENTATION
+*
+************************************************************************************/
+#include "physac.h"
+#if defined(PHYSAC_IMPLEMENTATION)
+
+#if !defined(PHYSAC_NO_THREADS)
+    #include <pthread.h>            // Required for: pthread_t, pthread_create()
+#endif
+
+#if defined(PHYSAC_DEBUG)
+    #include <stdio.h>              // Required for: printf()
+#endif
+
+#include <stdlib.h>                 // Required for: malloc(), free(), srand(), rand()
+#include <math.h>                   // Required for: cosf(), sinf(), fabs(), sqrtf()
+#include <stdint.h>                 // Required for: uint64_t
+
+#if !defined(PHYSAC_STANDALONE)
+    #include "raymath.h"            // Required for: Vector2Add(), Vector2Subtract()
+#endif
+
+// Time management functionality
+#include <time.h>                   // Required for: time(), clock_gettime()
+#if defined(_WIN32)
+    // Functions required to query time on Windows
+    int __stdcall QueryPerformanceCounter(unsigned long long int *lpPerformanceCount);
+    int __stdcall QueryPerformanceFrequency(unsigned long long int *lpFrequency);
+#elif defined(__linux__)
+    #if _POSIX_C_SOURCE < 199309L
+        #undef _POSIX_C_SOURCE
+        #define _POSIX_C_SOURCE 199309L // Required for CLOCK_MONOTONIC if compiled with c99 without gnu ext.
+    #endif
+    #include <sys/time.h>           // Required for: timespec
+#elif defined(__APPLE__)            // macOS also defines __MACH__
+    #include <mach/mach_time.h>     // Required for: mach_absolute_time()
+#endif
+
+//----------------------------------------------------------------------------------
+// Defines and Macros
+//----------------------------------------------------------------------------------
+#define     min(a,b)                    (((a)<(b))?(a):(b))
+#define     max(a,b)                    (((a)>(b))?(a):(b))
+#define     PHYSAC_FLT_MAX              3.402823466e+38f
+#define     PHYSAC_EPSILON              0.000001f
+#define     PHYSAC_K                    1.0f/3.0f
+#define     PHYSAC_VECTOR_ZERO          (Vector2){ 0.0f, 0.0f }
+
+//----------------------------------------------------------------------------------
+// Global Variables Definition
+//----------------------------------------------------------------------------------
+#if !defined(PHYSAC_NO_THREADS)
+static pthread_t physicsThreadId;                           // Physics thread id
+#endif
+static unsigned int usedMemory = 0;                         // Total allocated dynamic memory
+static bool physicsThreadEnabled = false;                   // Physics thread enabled state
+static double baseTime = 0.0;                               // Offset time for MONOTONIC clock
+static double startTime = 0.0;                              // Start time in milliseconds
+static double deltaTime = 1.0/60.0/10.0 * 1000;             // Delta time used for physics steps, in milliseconds
+static double currentTime = 0.0;                            // Current time in milliseconds
+static uint64_t frequency = 0;                              // Hi-res clock frequency
+
+static double accumulator = 0.0;                            // Physics time step delta time accumulator
+static unsigned int stepsCount = 0;                         // Total physics steps processed
+static Vector2 gravityForce = { 0.0f, 9.81f };              // Physics world gravity force
+static PhysicsBody bodies[PHYSAC_MAX_BODIES];               // Physics bodies pointers array
+static unsigned int physicsBodiesCount = 0;                 // Physics world current bodies counter
+static PhysicsManifold contacts[PHYSAC_MAX_MANIFOLDS];      // Physics bodies pointers array
+static unsigned int physicsManifoldsCount = 0;              // Physics world current manifolds counter
+
+//----------------------------------------------------------------------------------
+// Module Internal Functions Declaration
+//----------------------------------------------------------------------------------
+static int FindAvailableBodyIndex();                                                                        // Finds a valid index for a new physics body initialization
+static PolygonData CreateRandomPolygon(float radius, int sides);                                            // Creates a random polygon shape with max vertex distance from polygon pivot
+static PolygonData CreateRectanglePolygon(Vector2 pos, Vector2 size);                                       // Creates a rectangle polygon shape based on a min and max positions
+static void *PhysicsLoop(void *arg);                                                                        // Physics loop thread function
+static void PhysicsStep(void);                                                                              // Physics steps calculations (dynamics, collisions and position corrections)
+static int FindAvailableManifoldIndex();                                                                    // Finds a valid index for a new manifold initialization
+static PhysicsManifold CreatePhysicsManifold(PhysicsBody a, PhysicsBody b);                                 // Creates a new physics manifold to solve collision
+static void DestroyPhysicsManifold(PhysicsManifold manifold);                                               // Unitializes and destroys a physics manifold
+static void SolvePhysicsManifold(PhysicsManifold manifold);                                                 // Solves a created physics manifold between two physics bodies
+static void SolveCircleToCircle(PhysicsManifold manifold);                                                  // Solves collision between two circle shape physics bodies
+static void SolveCircleToPolygon(PhysicsManifold manifold);                                                 // Solves collision between a circle to a polygon shape physics bodies
+static void SolvePolygonToCircle(PhysicsManifold manifold);                                                 // Solves collision between a polygon to a circle shape physics bodies
+static void SolveDifferentShapes(PhysicsManifold manifold, PhysicsBody bodyA, PhysicsBody bodyB);           // Solve collision between two different types of shapes
+static void SolvePolygonToPolygon(PhysicsManifold manifold);                                                // Solves collision between two polygons shape physics bodies
+static void IntegratePhysicsForces(PhysicsBody body);                                                       // Integrates physics forces into velocity
+static void InitializePhysicsManifolds(PhysicsManifold manifold);                                           // Initializes physics manifolds to solve collisions
+static void IntegratePhysicsImpulses(PhysicsManifold manifold);                                             // Integrates physics collisions impulses to solve collisions
+static void IntegratePhysicsVelocity(PhysicsBody body);                                                     // Integrates physics velocity into position and forces
+static void CorrectPhysicsPositions(PhysicsManifold manifold);                                              // Corrects physics bodies positions based on manifolds collision information
+static float FindAxisLeastPenetration(int *faceIndex, PhysicsShape shapeA, PhysicsShape shapeB);            // Finds polygon shapes axis least penetration
+static void FindIncidentFace(Vector2 *v0, Vector2 *v1, PhysicsShape ref, PhysicsShape inc, int index);      // Finds two polygon shapes incident face
+static int Clip(Vector2 normal, float clip, Vector2 *faceA, Vector2 *faceB);                                // Calculates clipping based on a normal and two faces
+static bool BiasGreaterThan(float valueA, float valueB);                                                    // Check if values are between bias range
+static Vector2 TriangleBarycenter(Vector2 v1, Vector2 v2, Vector2 v3);                                      // Returns the barycenter of a triangle given by 3 points
+
+static void InitTimer(void);                                                                                // Initializes hi-resolution MONOTONIC timer
+static uint64_t GetTimeCount(void);                                                                         // Get hi-res MONOTONIC time measure in mseconds
+static double GetCurrentTime(void);                                                                         // Get current time measure in milliseconds
+
+// Math functions
+static Vector2 MathCross(float value, Vector2 vector);                                                      // Returns the cross product of a vector and a value
+static float MathCrossVector2(Vector2 v1, Vector2 v2);                                                      // Returns the cross product of two vectors
+static float MathLenSqr(Vector2 vector);                                                                    // Returns the len square root of a vector
+static float MathDot(Vector2 v1, Vector2 v2);                                                               // Returns the dot product of two vectors
+static inline float DistSqr(Vector2 v1, Vector2 v2);                                                        // Returns the square root of distance between two vectors
+static void MathNormalize(Vector2 *vector);                                                                 // Returns the normalized values of a vector
+#if defined(PHYSAC_STANDALONE)
+static Vector2 Vector2Add(Vector2 v1, Vector2 v2);                                                          // Returns the sum of two given vectors
+static Vector2 Vector2Subtract(Vector2 v1, Vector2 v2);                                                     // Returns the subtract of two given vectors
+#endif
+
+static Mat2 Mat2Radians(float radians);                                                                     // Creates a matrix 2x2 from a given radians value
+static void Mat2Set(Mat2 *matrix, float radians);                                                           // Set values from radians to a created matrix 2x2
+static inline Mat2 Mat2Transpose(Mat2 matrix);                                                              // Returns the transpose of a given matrix 2x2
+static inline Vector2 Mat2MultiplyVector2(Mat2 matrix, Vector2 vector);                                     // Multiplies a vector by a matrix 2x2
+
 //----------------------------------------------------------------------------------
 // Module Functions Definition
 //----------------------------------------------------------------------------------
@@ -1791,3 +1912,5 @@ static inline Vector2 Mat2MultiplyVector2(Mat2 matrix, Vector2 vector)
 {
     return (Vector2){ matrix.m00*vector.x + matrix.m01*vector.y, matrix.m10*vector.x + matrix.m11*vector.y };
 }
+
+#endif  // PHYSAC_IMPLEMENTATION
